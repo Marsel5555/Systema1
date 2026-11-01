@@ -20,24 +20,25 @@ SPEC_ITEMS: List[SpecItem] = []
 STATUS_MESSAGE: str = ""
 
 def build_supplier_links(item_name: str) -> List[dict]:
-    query_clean = re.sub(r"[^a-zA-Zа-яА-Я0-9\s\-\./]", "", item_name).strip()
+    query_clean = re.sub(r"[^a-zA-Zа-яА-Я0-9\s\-\./]", " ", item_name).strip()
+    query_clean = re.sub(r"\s+", " ", query_clean)
     encoded = urllib.parse.quote(query_clean)
     return [
         {
             "channel": "Supl.biz (Оптовые базы)",
-            "title": f"Поставщики {query_clean}",
+            "title": f"Поставщики: {query_clean[:35]}...",
             "url": f"https://supl.biz/search/?q={encoded}",
             "badge": "B2B Платформа"
         },
         {
             "channel": "Пульс Цен (Прайс-листы)",
-            "title": "Каталог производителей",
+            "title": "Каталог заводов и дилеров",
             "url": f"https://pulscen.ru/search/price?q={encoded}",
-            "badge": "Каталог заводов"
+            "badge": "Складские прайсы"
         },
         {
             "channel": "Яндекс Поиск (Опт и склады)",
-            "title": "Купить оптом у дилера",
+            "title": "Купить оптом у поставщика",
             "url": f"https://yandex.ru/search/?text={encoded}+купить+оптом+производитель+склад",
             "badge": "Прямой поиск"
         }
@@ -61,9 +62,9 @@ HTML_TEMPLATE = """
                 <div class="flex items-center gap-3">
                     <span class="text-3xl">🚀</span>
                     <h1 class="text-2xl font-bold text-slate-900 tracking-tight">AutoProcure Cloud MVP</h1>
-                    <span class="bg-emerald-100 text-emerald-800 text-xs font-semibold px-2.5 py-0.5 rounded-full">Тестовый стенд</span>
+                    <span class="bg-emerald-100 text-emerald-800 text-xs font-semibold px-2.5 py-0.5 rounded-full">Универсальный парсер активен</span>
                 </div>
-                <p class="text-sm text-slate-500 mt-1">Загрузка спецификации &rarr; Распознавание номенклатуры &rarr; Автопоиск каналов поставщиков</p>
+                <p class="text-sm text-slate-500 mt-1">Загрузка спецификации &rarr; Умное распознавание номенклатуры &rarr; Автопоиск поставщиков</p>
             </div>
             {% if spec_items %}
             <a href="/clear" class="text-xs text-rose-600 hover:text-rose-800 bg-rose-50 border border-rose-200 px-3 py-1.5 rounded-lg transition self-start">
@@ -84,7 +85,7 @@ HTML_TEMPLATE = """
                     <h2 class="font-bold text-slate-900 mb-1 flex items-center gap-2">
                         <span>📊</span> Загрузить файл спецификации
                     </h2>
-                    <p class="text-xs text-slate-500 mb-4">Поддерживаются форматы <code>.xlsx</code>, <code>.xls</code>, <code>.csv</code>.</p>
+                    <p class="text-xs text-slate-500 mb-4">Поддерживаются любые файлы <code>.xlsx</code>, <code>.xls</code>, <code>.csv</code>. Сервис автоматически пропустит шапку и найдет колонки с товаром и количеством.</p>
                     
                     <form action="/upload-file" method="post" enctype="multipart/form-data">
                         <div class="border-2 border-dashed border-slate-200 rounded-xl p-6 text-center hover:border-blue-400 transition mb-4 bg-slate-50">
@@ -192,40 +193,84 @@ async def upload_file(file: UploadFile = File(...)):
         if filename.endswith(".csv"):
             df = pd.read_csv(io.BytesIO(contents))
         else:
-            df = pd.read_excel(io.BytesIO(contents))
-        
+            # Читаем сначала «сырой» файл без заголовков, чтобы просканировать шапку
+            df_raw = pd.read_excel(io.BytesIO(contents), header=None)
+            
+            # 1. Поиск реальной строки заголовков (ищем ключевые слова шапки)
+            header_idx = 0
+            for idx, row in df_raw.head(20).iterrows():
+                row_str = " ".join([str(val).lower() for val in row.values if pd.notna(val)])
+                if any(k in row_str for k in ["наименование", "товар", "оборудование", "прибор", "марка", "номенклатура", "продукт", "описание", "тип"]):
+                    header_idx = idx
+                    break
+            
+            # Перечитываем файл, начиная с найденной строки заголовков
+            df = pd.read_excel(io.BytesIO(contents), header=header_idx)
+
+        # 2. Интеллектуальный поиск колонки с названием товара
         name_col = None
         qty_col = None
+        unit_col = None
         
         for col in df.columns:
             c_low = str(col).lower()
-            if any(k in c_low for k in ["наименование", "товар", "номенклатура", "позиция", "name", "item"]):
+            if any(k in c_low for k in ["наименование", "товар", "оборудование", "прибор", "марка", "номенклатура", "модель", "item", "name"]):
                 name_col = col
                 break
+        
+        # Если явного заголовка нет — выбираем столбец с наибольшей средней длиной текста
         if not name_col:
-            name_col = df.columns[0]
+            text_lens = {}
+            for col in df.columns:
+                avg_len = df[col].astype(str).str.len().mean()
+                text_lens[col] = avg_len
+            name_col = max(text_lens, key=text_lens.get)
             
         for col in df.columns:
             c_low = str(col).lower()
-            if any(k in c_low for k in ["кол", "количество", "qty", "count"]):
+            if any(k in c_low for k in ["кол-во", "колво", "количество", "qty", "объем"]):
                 qty_col = col
                 break
 
+        for col in df.columns:
+            c_low = str(col).lower()
+            if any(k in c_low for k in ["ед.", "ед. изм", "единица", "измерения", "unit"]):
+                unit_col = col
+                break
+
+        # 3. Извлечение позиций и фильтрация служебных строк
+        added_count = 0
         for _, row in df.iterrows():
             raw_name = str(row[name_col]).strip()
-            if not raw_name or raw_name.lower() == "nan":
+            
+            # Пропускаем пустые ячейки, NaN, технические разделители и чисто числа
+            if not raw_name or raw_name.lower() in ["nan", "none", "", "null"] or raw_name.isdigit():
                 continue
-            qty_val = str(row[qty_col]) if qty_col and str(row[qty_col]) != "nan" else "1"
+            if len(raw_name) < 3:
+                continue
+            # Игнорируем повтор шапки или заголовки разделов
+            if raw_name.lower() in ["наименование", "наименование товара", "номенклатура", "итого"]:
+                continue
+                
+            qty_val = str(row[qty_col]).strip() if qty_col and pd.notna(row[qty_col]) else "1"
+            qty_val = qty_val.split(".")[0] if "." in qty_val and qty_val.split(".")[1] == "0" else qty_val
+            if qty_val.lower() == "nan" or not qty_val:
+                qty_val = "1"
+                
+            unit_val = str(row[unit_col]).strip() if unit_col and pd.notna(row[unit_col]) else "шт"
+            if unit_val.lower() == "nan" or not unit_val:
+                unit_val = "шт"
             
             SPEC_ITEMS.append(SpecItem(
                 id=len(SPEC_ITEMS) + 1,
                 name=raw_name,
                 quantity=qty_val,
-                unit="шт",
+                unit=unit_val,
                 search_queries=build_supplier_links(raw_name)
             ))
+            added_count += 1
             
-        STATUS_MESSAGE = f"Файл {file.filename} успешно обработан. Извлечено позиций: {len(df)}"
+        STATUS_MESSAGE = f"Файл {file.filename} успешно обработан! Распознано и добавлено позиций: {added_count}."
     except Exception as e:
         STATUS_MESSAGE = f"Ошибка обработки файла: {str(e)}"
         
@@ -234,7 +279,8 @@ async def upload_file(file: UploadFile = File(...)):
 @app.post("/upload-text")
 def upload_text(raw_text: str = Form(...)):
     global STATUS_MESSAGE
-    lines = raw_text.strip().split("\n")
+    lines = raw_text.strip().split("
+")
     added = 0
     for line in lines:
         line = line.strip()
